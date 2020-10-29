@@ -1,0 +1,495 @@
+---
+title: "Kaggle_Airbnb"
+author: "Saloni Mohan"
+date: "12/3/2018"
+output: html_document
+---
+
+## Kaggle Competition - Predicting prices for Airbnb rentals in NYC
+
+The goal of this competition is to predict the price for airbnb rentals using over 90 variables on the property, host, and past reviews.
+
+## load libraries
+```{r}
+library(ggplot2)
+library(corrplot)
+library(randomForest)
+library(tidyr)
+library(plyr)
+library(dplyr)
+library(caret)
+library(gbm)
+library(stringr)
+library(xgboost)
+```
+
+## Set working directory and input analysisData.csv and scoringData.csv data files
+
+```{r}
+setwd("/Users/pratykisallo/Kaggle/AirBNB")
+Analysis_Orig <- read.csv(file="analysisData.csv",head=TRUE,sep=",")
+Scoring_Orig <- read.csv(file="scoringData.csv",head=TRUE,sep=",")
+```
+
+
+## Data Size and Structure
+
+```{r}
+dim(Analysis_Orig)
+dim(Scoring_Orig)
+```
+
+```{r}
+str(Analysis_Orig)
+str(Scoring_Orig)
+```
+
+## Analysing Response Variable: price
+```{r}
+ggplot(data = Analysis_Orig[!is.na(Analysis_Orig$price),]) +
+geom_histogram(mapping = aes(x = price), binwidth = 10, fill="blue")
+summary(Analysis_Orig$price)
+```
+
+## Most important numeric variables
+```{r}
+numericVars <- which(sapply(Analysis_Orig, is.numeric)) #index vector numeric variables
+numericVarNames <- names(numericVars) #saving names vector for use later on
+cat('There are', length(numericVars), 'numeric variables')
+
+all_numVar <- Analysis_Orig[, numericVars]
+cor_numVar <- cor(all_numVar, use="pairwise.complete.obs") #correlations of all numeric variables
+
+cor_sorted <- as.matrix(sort(cor_numVar[,'price'], decreasing = TRUE)) #sort on decreasing correlations with SalePrice
+
+#select only high corelations
+CorHigh <- names(which(apply(cor_sorted, 1, function(x) abs(x)>0.3)))
+cor_numVar <- cor_numVar[CorHigh, CorHigh]
+corrplot.mixed(cor_numVar, tl.col="black", tl.pos = "lt")
+```
+
+
+## Analysis of text variables
+```{r}
+# these are the important text variables
+
+# summary
+# description
+# transit
+# access
+# interaction
+# notes
+# host_about
+# house_rules
+# amenities
+
+# online-utility.org was used to do text mining on summary and description
+# 'in the heart of' was a top phrase in summary
+Analysis_Orig$heart <- grepl("in the heart of", Analysis_Orig$summary) 
+Analysis_Orig$heart <- as.numeric(Analysis_Orig$heart)
+sum(Analysis_Orig$heart)*100/nrow(Analysis_Orig)
+cor(Analysis_Orig$price, Analysis_Orig$heart)
+
+# 'beautiful and spacious' was a top phrase in summary
+Analysis_Orig$beautiful <- grepl("beautiful and spacious", Analysis_Orig$summary) 
+Analysis_Orig$beautiful <- as.numeric(Analysis_Orig$beautiful)
+sum(Analysis_Orig$beautiful)*100/nrow(Analysis_Orig)
+cor(Analysis_Orig$price, Analysis_Orig$beautiful)
+
+# 'solo adventurers', 'couples', 'business travelers' were top phrases in description
+Analysis_Orig$solo <- grepl("solo adventurers", Analysis_Orig$description) 
+Analysis_Orig$solo <- as.numeric(Analysis_Orig$solo)
+sum(Analysis_Orig$solo)*100/nrow(Analysis_Orig)
+cor(Analysis_Orig$price, Analysis_Orig$solo)
+
+Analysis_Orig$couples <- grepl("couples|romantic", Analysis_Orig$description) 
+Analysis_Orig$couples <- as.numeric(Analysis_Orig$couples)
+sum(Analysis_Orig$couples)*100/nrow(Analysis_Orig)
+cor(Analysis_Orig$price, Analysis_Orig$couples)
+
+Analysis_Orig$business <- grepl("business travelers|business traveler|business", Analysis_Orig$description) 
+Analysis_Orig$business <- as.numeric(Analysis_Orig$business)
+sum(Analysis_Orig$business)*100/nrow(Analysis_Orig)
+cor(Analysis_Orig$price, Analysis_Orig$business)
+
+```
+
+## Neighborhood Variables
+```{r}
+#neighbourhood, host_location, host_neighborhood, street, state, city, zipcode, market, smartlocation, country, is_location_exact will not be used due to either unclean data or due to imbalanced data
+
+# head(Analysis_Orig$neighbourhood)
+# head(Analysis_Orig$host_location)
+# head(Analysis_Orig$host_neighborhood)
+# head(Analysis_Orig$street)
+# head(Analysis_Orig$state)
+# head(Analysis_Orig$city)
+# head(Analysis_Orig$zipcode)
+# head(Analysis_Orig$market)
+# head(Analysis_Orig$smartlocation)
+# head(Analysis_Orig$country)
+# head(Analysis_Orig$is_location_exact)
+
+# neighbourhood_group_cleansed, longitude, latitude are important variables
+as.data.frame(table(Analysis_Orig$neighbourhood_group_cleansed))
+
+```
+
+
+## Missing Values
+```{r}
+NAcol_Analysis <- which(colSums(is.na(Analysis_Orig)) > 0)
+sort(colSums(sapply(Analysis_Orig[NAcol_Analysis], is.na)), decreasing = TRUE)
+
+cat('There are', length(NAcol_Analysis), 'columns with missing values in Analysis set')
+
+NAcol_Scoring <- which(colSums(is.na(Scoring_Orig)) > 0)
+sort(colSums(sapply(Scoring_Orig[NAcol_Scoring], is.na)), decreasing = TRUE)
+
+cat('There are', length(NAcol_Scoring), 'columns with missing values in Scoring set')
+
+
+```
+
+## Splitting the Analysis file
+
+```{r}
+set.seed(100) # set seed to ensure results can be replicated
+split = sample(1:nrow(Analysis_Orig),0.7*nrow(Analysis_Orig))
+train = Analysis_Orig[split,]
+test = Analysis_Orig[-split,]
+```
+
+
+
+## Imputing Missing Values
+
+```{r}
+# Cleaning fee imputed with 0
+train$cleaning_fee[is.na(train$cleaning_fee)] <- 0
+test$cleaning_fee[is.na(test$cleaning_fee)] <- 0
+Scoring_Orig$cleaning_fee[is.na(Scoring_Orig$cleaning_fee)] <- 0
+
+# beds imputed with median
+train$beds[is.na(train$beds)] <- median(train$beds,na.rm=TRUE)
+test$beds[is.na(test$beds)] <- median(test$beds, na.rm=TRUE)
+Scoring_Orig$beds[is.na(Scoring_Orig$beds)] <- median(Scoring_Orig$beds, na.rm = TRUE)
+
+# Security deposit imputing with 0 
+train$security_deposit[is.na(train$security_deposit)] <- 0
+test$security_deposit[is.na(test$security_deposit)] <- 0
+Scoring_Orig$security_deposit[is.na(Scoring_Orig$security_deposit)] <- 0
+
+# reviews per month and last_Review
+Scoring_Orig$reviews_per_month[is.na(Scoring_Orig$reviews_per_month)] <- 0
+
+Scoring_Orig$last_review <- as.Date(Scoring_Orig$last_review)
+Scoring_Orig$last_review[is.na(Scoring_Orig$last_review)] <- "1999-01-01"
+
+
+```
+
+
+## Transformation of existing variables
+
+```{r}
+# Factor variables to numeric
+
+train$host_is_superhost <- as.numeric(train$host_is_superhost)
+test$host_is_superhost <- as.numeric(test$host_is_superhost)
+Scoring_Orig$host_is_superhost <- as.numeric(Scoring_Orig$host_is_superhost)
+
+train$instant_bookable <- as.numeric(train$instant_bookable)
+test$instant_bookable <- as.numeric(test$instant_bookable)
+Scoring_Orig$instant_bookable <- as.numeric(Scoring_Orig$instant_bookable)
+
+train$host_identity_verified <- as.numeric(train$host_identity_verified)
+test$host_identity_verified <- as.numeric(test$host_identity_verified)
+Scoring_Orig$host_identity_verified <- as.numeric(Scoring_Orig$host_identity_verified)
+
+train$is_business_travel_ready <- as.numeric(train$is_business_travel_ready)
+test$is_business_travel_ready<- as.numeric(test$is_business_travel_ready)
+Scoring_Orig$is_business_travel_ready <- as.numeric(Scoring_Orig$is_business_travel_ready)
+
+```
+
+
+```{r}
+# Host_since changed to number of days from today
+
+train$host_since <- as.Date(train$host_since)
+test$host_since <- as.Date(test$host_since)
+Scoring_Orig$host_since <- as.Date(Scoring_Orig$host_since)
+
+train$host_since_days <- difftime(Sys.Date(), train$host_since, units="days")
+test$host_since_days <- difftime(Sys.Date(), test$host_since, units="days")
+Scoring_Orig$host_since_days <- difftime(Sys.Date(), Scoring_Orig$host_since, units="days")
+
+train$host_since_days <- as.numeric(train$host_since_days)
+test$host_since_days <- as.numeric(test$host_since_days)
+Scoring_Orig$host_since_days <- as.numeric(Scoring_Orig$host_since_days)
+
+
+# Calendar_last_scraped changed to number of days from today
+train$calendar_last_scraped<- as.Date(train$calendar_last_scraped)
+test$calendar_last_scraped<- as.Date(test$calendar_last_scraped)
+Scoring_Orig$calendar_last_scraped<- as.Date(Scoring_Orig$calendar_last_scraped)
+
+
+train$Cal_last_scraped_days <- difftime(Sys.Date(), train$calendar_last_scraped, units="days")
+test$Cal_last_scraped_days <- difftime(Sys.Date(), test$calendar_last_scraped, units="days")
+Scoring_Orig$Cal_last_scraped_days <- difftime(Sys.Date(), Scoring_Orig$calendar_last_scraped, units="days")
+
+train$Cal_last_scraped_days  <- as.numeric(train$Cal_last_scraped_days)
+test$Cal_last_scraped_days  <- as.numeric(test$Cal_last_scraped_days)
+Scoring_Orig$Cal_last_scraped_days  <- as.numeric(Scoring_Orig$Cal_last_scraped_days)
+
+
+# last_review changed to number of days from today
+train$last_review<- as.Date(train$last_review)
+test$last_review<- as.Date(test$last_review)
+Scoring_Orig$last_review<- as.Date(Scoring_Orig$last_review)
+
+train$last_review_days <- difftime(Sys.Date(), train$last_review, units="days")
+test$last_review_days <- difftime(Sys.Date(), test$last_review, units="days")
+Scoring_Orig$last_review_days <- difftime(Sys.Date(), Scoring_Orig$last_review, units="days")
+
+train$last_review_days  <- as.numeric(train$last_review_days)
+test$last_review_days  <- as.numeric(test$last_review_days)
+Scoring_Orig$last_review_days  <- as.numeric(Scoring_Orig$last_review_days)
+
+
+```
+
+```{r}
+# Renamed levels in host_response_time
+levels(train$host_response_time)[levels(train$host_response_time)=="N/A"] <- "No Reply"
+levels(test$host_response_time)[levels(test$host_response_time)=="N/A"] <- "No Reply"
+levels(Scoring_Orig$host_response_time)[levels(Scoring_Orig$host_response_time)=="N/A"] <- "No Reply"
+
+
+```
+
+
+```{r}
+# host_Response_Rate changed to decimal formats
+train$host_response_rate<- as.numeric(gsub("%", "", as.character(train$host_response_rate)))/100
+train$host_response_rate[is.na(train$host_response_rate)] <-0
+
+test$host_response_rate<- as.numeric(gsub("%", "", as.character(test$host_response_rate)))/100
+test$host_response_rate[is.na(test$host_response_rate)] <-0
+
+Scoring_Orig$host_response_rate<- as.numeric(gsub("%", "", as.character(Scoring_Orig$host_response_rate)))/100
+Scoring_Orig$host_response_rate[is.na(Scoring_Orig$host_response_rate)] <-0
+
+```
+
+## Creation of new variables
+
+
+```{r}
+# property_type (new variable)
+train$property_type_new[train$property_type=="Apartment"]="Apartment" 
+train$property_type_new[train$property_type=="Condominium"]="Condominium"
+train$property_type_new[train$property_type=="House"]="House"
+train$property_type_new[train$property_type=="Loft"]="Loft"
+train$property_type_new[train$property_type=="Townhouse"]="Townhouse"
+train$property_type_new[which(train$property_type!="Townhouse" & train$property_type!="Apartment" &train$property_type!="Condominium" & train$property_type!="House" & train$property_type!="Loft")]="Others"
+
+test$property_type_new[test$property_type=="Apartment"]="Apartment" 
+test$property_type_new[test$property_type=="Condominium"]="Condominium"
+test$property_type_new[test$property_type=="House"]="House"
+test$property_type_new[test$property_type=="Loft"]="Loft"
+test$property_type_new[test$property_type=="Townhouse"]="Townhouse"
+test$property_type_new[which(test$property_type!="Townhouse" & test$property_type!="Apartment" & test$property_type!="Condominium" & test$property_type!="House" & test$property_type!="Loft")]="Others"
+
+Scoring_Orig$property_type_new[Scoring_Orig$property_type=="Apartment"]="Apartment" 
+Scoring_Orig$property_type_new[Scoring_Orig$property_type=="Condominium"]="Condominium"
+Scoring_Orig$property_type_new[Scoring_Orig$property_type=="House"]="House"
+Scoring_Orig$property_type_new[Scoring_Orig$property_type=="Loft"]="Loft"
+Scoring_Orig$property_type_new[Scoring_Orig$property_type=="Townhouse"]="Townhouse"
+Scoring_Orig$property_type_new[which(Scoring_Orig$property_type!="Townhouse" & Scoring_Orig$property_type!="Apartment" & Scoring_Orig$property_type!="Condominium" & Scoring_Orig$property_type!="House" & Scoring_Orig$property_type!="Loft")]="Others"
+
+train$property_type_new <- as.factor(train$property_type_new)
+test$property_type_new <- as.factor(test$property_type_new)
+Scoring_Orig$property_type_new <- as.factor(Scoring_Orig$property_type_new)
+
+#------- wifi variable
+
+train$wifi<- grepl("Wifi|wifi|internet|Internet", train$amenities)
+train$wifi <- as.numeric(train$wifi)
+
+sum(train$wifi)*100/nrow(train)
+cor(train$price,train$wifi)
+
+#----- TV variable 
+train$TV<- grepl("TV|Cable TV|tv|Cable tv", train$amenities)
+train$TV <- as.numeric(train$TV)
+
+test$TV<- grepl("TV|Cable TV|tv|Cable tv", test$amenities)
+test$TV <- as.numeric(test$TV)
+
+Scoring_Orig$TV<- grepl("TV|Cable TV|tv|Cable tv", Scoring_Orig$amenities)
+Scoring_Orig$TV <- as.numeric(Scoring_Orig$TV)
+
+#-------GYM variable 
+train$Gym<- grepl("Gym|gym", train$amenities)
+train$Gym <- as.numeric(train$Gym)
+
+sum(train$Gym)*100/nrow(train)
+cor(train$price,train$Gym)
+
+test$Gym<- grepl("Gym|gym", test$amenities)
+test$Gym <- as.numeric(test$Gym)
+
+Scoring_Orig$Gym<- grepl("Gym|gym", Scoring_Orig$amenities)
+Scoring_Orig$Gym <- as.numeric(Scoring_Orig$Gym)
+
+
+#--------Free Parking
+train$parking<- grepl("Free Parking|Free parking|Parking|parking|Free Street Parking|Free street parking", train$amenities)
+train$parking <- as.numeric(train$parking)
+
+test$parking<- grepl("Free Parking|Free parking|Parking|parking", test$amenities)
+test$parking <- as.numeric(test$parking)
+
+Scoring_Orig$parking<- grepl("Free Parking|Free parking|Parking|parking", Scoring_Orig$amenities)
+Scoring_Orig$parking <- as.numeric(Scoring_Orig$parking)
+
+#--------- Smoke detector
+train$smoke <- grepl("smoke detector|Smoke Detector|Smoke detector", train$amenities)
+train$smoke <- as.numeric(train$smoke)
+
+test$smoke <- grepl("smoke detector|Smoke Detector|Smoke detector", test$amenities)
+test$smoke <- as.numeric(test$smoke)
+
+Scoring_Orig$smoke <- grepl("smoke detector|Smoke Detector|Smoke detector", Scoring_Orig$amenities)
+Scoring_Orig$smoke <- as.numeric(Scoring_Orig$smoke)
+
+# ------- Family/kids friendly
+train$Family <- grepl("Family/kid friendly", train$amenities)
+train$Family <- as.numeric(train$Family)
+
+test$Family <- grepl("Family/kid friendly", test$amenities)
+test$Family <- as.numeric(test$Family)
+
+Scoring_Orig$Family <- grepl("Family/kid friendly", Scoring_Orig$amenities)
+Scoring_Orig$Family <- as.numeric(Scoring_Orig$Family)
+
+
+# ------- subway ----- 
+
+train$subway <- grepl("Subway|subway|Subways|subways", train$transit)
+train$subway <- as.numeric(train$subway)
+
+test$subway <- grepl("Subway|subway|Subways|subways", test$transit)
+test$subway <- as.numeric(test$subway)
+
+Scoring_Orig$subway <- grepl("Subway|subway|Subways|subways", Scoring_Orig$transit)
+Scoring_Orig$subway <- as.numeric(Scoring_Orig$subway)
+
+# ------- count of amenities
+amenities.string <- paste ( train$amenities , collapse = "," )
+amenities.vector <- strsplit (amenities.string , "," )[[1]]
+amenities.vector.clean <- gsub ( " " , "" , amenities.vector)
+
+#table(amenities.vector.clean)
+
+train$amenities <- as.character(train$amenities)
+train$amenities_count <- str_count(train$amenities, ',')
+head(train$amenities_count)
+
+
+
+amenities.string <- paste ( test$amenities , collapse = "," )
+amenities.vector <- strsplit (amenities.string , "," )[[1]]
+amenities.vector.clean <- gsub ( " " , "" , amenities.vector)
+
+# table(amenities.vector.clean)
+
+test$amenities <- as.character(test$amenities)
+test$amenities_count <- str_count(test$amenities, ',')
+head(test$amenities_count)
+
+amenities.string <- paste ( Scoring_Orig$amenities , collapse = "," )
+amenities.vector <- strsplit (amenities.string , "," )[[1]]
+amenities.vector.clean <- gsub ( " " , "" , amenities.vector)
+
+# table(amenities.vector.clean)
+
+Scoring_Orig$amenities <- as.character(Scoring_Orig$amenities)
+Scoring_Orig$amenities_count <- str_count(Scoring_Orig$amenities, ',')
+head(Scoring_Orig$amenities_count)
+
+
+```
+
+## Lasso for feature selection
+
+```{r}
+# deleting thumbial, medium, picture, license, monthly, square_feet, weekly_price
+train <- select(train, -thumbnail_url, -medium_url, -xl_picture_url, -license, -monthly_price, -square_feet, -weekly_price)
+test  <- select(test, -thumbnail_url, -medium_url, -xl_picture_url, -license, -monthly_price, -square_feet, -weekly_price)
+
+
+Scoring_Orig  <- select(Scoring_Orig, -thumbnail_url, -medium_url, -xl_picture_url, -license, -monthly_price, -square_feet, -weekly_price)
+
+which( colnames(train)=="price" )
+
+# lasso numeric variables for train
+numericVars <- which(sapply(train, is.numeric)) #index vector numeric variables
+numericVarNames <- names(numericVars) #saving names vector for use later on
+train_all_numVar <- train[, numericVars]
+
+which( colnames(train_all_numVar)=="price" )
+
+# lasso numeric variables for test
+numericVars <- which(sapply(test, is.numeric)) #index vector numeric variables
+numericVarNames <- names(numericVars) #saving names vector for use later on
+test_all_numVar <- test[, numericVars]
+
+
+# lasso numeric variables for Scoring
+numericVars <- which(sapply(Scoring_Orig, is.numeric)) #index vector numeric variables
+numericVarNames <- names(numericVars) #saving names vector for use later on
+Scoring_orig_all_numVar <- Scoring_Orig[, numericVars]
+
+library(glmnet)
+
+x = model.matrix(price~.-1,data=train_all_numVar)
+y = train_all_numVar$price
+
+lassoModel = glmnet(x,y, alpha=1)
+
+cv.lasso = cv.glmnet(x,y,alpha=1)
+
+coef(cv.lasso)
+```
+
+## Gradient Boosting
+
+```{r}
+set.seed(100)
+boost = gbm(price~ host_since_days + host_response_time + host_response_rate + host_is_superhost + host_listings_count + host_identity_verified + neighbourhood_group_cleansed + latitude + longitude + property_type_new + room_type + accommodates + bathrooms + bedrooms + beds + bed_type + security_deposit + cleaning_fee + guests_included + extra_people + minimum_nights + maximum_nights + availability_30 + availability_60 + availability_90 + availability_365 + Cal_last_scraped_days + number_of_reviews + last_review_days + review_scores_rating + review_scores_accuracy + review_scores_cleanliness + review_scores_checkin + review_scores_communication + review_scores_location + review_scores_value + instant_bookable + is_business_travel_ready + cancellation_policy + reviews_per_month + amenities_count,data=train,distribution="gaussian",
+            n.trees = 100000,interaction.depth = 3,shrinkage = 0.001)
+
+pred_in_sample=predict(boost, newdata = train, n.trees = 100000)
+rmse25_in_sample=  sqrt(mean((pred_in_sample-train$price)^2))
+rmse25_in_sample
+pred_out_of_sample = predict(boost,newdata=test, n.trees = 100000)
+rmse25_out_of_sample = sqrt(mean((pred_out_of_sample-test$price)^2)) 
+rmse25_out_of_sample 
+
+pred = predict(boost,newdata=Scoring_Orig, n.trees = 100000 )
+submissionFile = data.frame(id = Scoring_Orig$id, price = pred)
+
+
+write.csv(submissionFile, 'sample_submission30.csv',row.names = F)
+
+summary(boost)
+
+```
+
+
+
+
