@@ -1,8 +1,4 @@
----
-title: "Kaggle_Airbnb"
-author: "Saloni Mohan"
-date: "12/3/2018"
-output: html_document
+
 ---
 
 ## Kaggle Competition - Predicting prices for Airbnb rentals in NYC
